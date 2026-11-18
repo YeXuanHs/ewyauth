@@ -1,0 +1,77 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: php-${{ matrix.php }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["7.2", "7.3", "7.4"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "${{ matrix.php }}"
+          coverage: none
+          tools: none
+
+      - name: Build extension
+        run: |
+          set -eux
+          phpize
+          ./configure --with-php-config="$(command -v php-config)"
+          make -j"$(nproc)"
+
+      - name: Smoke test
+        run: |
+          set -eux
+          php -d extension="$(pwd)/modules/ewyauth.so" \
+               -r 'exit(extension_loaded("ewyauth") ? 0 : 1);'
+          php -d extension="$(pwd)/modules/ewyauth.so" --ri ewyauth
+
+      - name: Package
+        run: |
+          set -eux
+          mkdir -p dist
+          cp modules/ewyauth.so "dist/ewyauth-${{ matrix.php }}-nts-linux-x86_64.so"
+          sha256sum dist/*.so > "dist/SHA256SUMS-${{ matrix.php }}.txt"
+          cat "dist/SHA256SUMS-${{ matrix.php }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ewyauth-php${{ matrix.php }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -la dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

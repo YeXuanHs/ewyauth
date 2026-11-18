@@ -1,0 +1,33 @@
+# build artefacts (phpize / make)
+*.lo
+*.la
+*.so
+*.o
+.libs/
+modules/
+build/
+include/
+autom4te.cache/
+dist/
+configure
+configure.ac
+config.h
+config.h.in
+config.log
+config.nice
+config.status
+libtool
+Makefile
+Makefile.fragments
+Makefile.global
+Makefile.objects
+run-tests.php
+
+# keep the m4 source
+!config.m4
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
