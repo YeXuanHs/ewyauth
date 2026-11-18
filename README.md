@@ -38,6 +38,9 @@
 
 ZTS 未验证。PHP 8 未适配（`zend_execute_ex` 与内部函数 handler 的调用约定不同）。
 
+产物只依赖 `libc.so.6`，最高符号版本 `GLIBC_2.4` —— CentOS 7 / Debian 9 及以上可直接加载，
+不受 CI 构建机（Ubuntu 22.04）的 glibc 版本限制。
+
 ## 安装
 
 从 [Releases](https://github.com/YeXuanHs/ewyauth/releases) 下载对应 PHP 版本的 `ewyauth-<ver>-nts-linux-x86_64.so`，
