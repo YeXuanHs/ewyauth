@@ -136,6 +136,63 @@ static void patch_if_present(const char *name, size_t len, int ok_mode)
     }
 }
 
+static void stub_authorized(zend_execute_data *ed, zval *rv)
+{
+    (void) ed;
+    if (rv) fill_authorized(rv);
+}
+
+static void stub_ok(zend_execute_data *ed, zval *rv)
+{
+    (void) ed;
+    if (rv) fill_ok(rv);
+}
+
+static char lower_ch(char c) { return (c >= 'A' && c <= 'Z') ? (char) (c + 32) : c; }
+
+/* 按 类名::方法名 把函数项换成一个内部函数桩（类表 key 也是小写） */
+static void patch_method(const char *cls, size_t clen, const char *meth, size_t mlen, int ok_mode)
+{
+    char lowc[96], lowm[96];
+    zend_class_entry *ce;
+    zval *slot;
+    zend_function *orig;
+    zend_internal_function *stub;
+    size_t i;
+
+    if (clen >= sizeof(lowc) || mlen >= sizeof(lowm)) return;
+    if (!EG(class_table)) return;
+
+    for (i = 0; i < clen; i++) lowc[i] = lower_ch(cls[i]);
+    lowc[clen] = 0;
+    for (i = 0; i < mlen; i++) lowm[i] = lower_ch(meth[i]);
+    lowm[mlen] = 0;
+
+    ce = zend_hash_str_find_ptr(EG(class_table), lowc, clen);
+    if (!ce) return;
+
+    slot = zend_hash_str_find(&ce->function_table, lowm, mlen);
+    if (!slot || Z_TYPE_P(slot) != IS_PTR) return;
+
+    orig = (zend_function *) Z_PTR_P(slot);
+    if (!orig) return;
+    if (orig->type == ZEND_INTERNAL_FUNCTION) return;   /* 已经换过 */
+
+    stub = (zend_internal_function *) calloc(1, sizeof(zend_internal_function));
+    if (!stub) return;
+
+    stub->type = ZEND_INTERNAL_FUNCTION;
+    stub->function_name = zend_string_init(lowm, mlen, 1);
+    stub->scope = ce;
+    stub->fn_flags = ZEND_ACC_PUBLIC;
+    stub->num_args = 0;
+    stub->required_num_args = 0;
+    stub->handler = ok_mode ? stub_ok : stub_authorized;
+
+    Z_PTR_P(slot) = stub;
+    ewy_log("[ewyauth] replaced %s::%s with internal stub", cls, meth);
+}
+
 /* ---------------- function_exists 钩子 ---------------- */
 
 static void ewy_function_exists(zend_execute_data *execute_data, zval *return_value)
@@ -154,6 +211,13 @@ static void ewy_function_exists(zend_execute_data *execute_data, zval *return_va
     patch_if_present("verifyAuthorization", sizeof("verifyAuthorization") - 1, 0);
     patch_if_present("reportAuthorizedInstallation",
                      sizeof("reportAuthorizedInstallation") - 1, 1);
+
+    /* 后台绑定页：两个授权客户端的 verify/bind 一律返回 ok，卡密随便填 */
+    patch_method("LicenseSdkV2", sizeof("LicenseSdkV2") - 1, "verify", sizeof("verify") - 1, 1);
+    patch_method("HuanwareLicenseClient", sizeof("HuanwareLicenseClient") - 1,
+                 "verify", sizeof("verify") - 1, 1);
+    patch_method("HuanwareLicenseClient", sizeof("HuanwareLicenseClient") - 1,
+                 "bind", sizeof("bind") - 1, 1);
 }
 
 /* ---------------- session_start 钩子（后台门禁） ---------------- */
