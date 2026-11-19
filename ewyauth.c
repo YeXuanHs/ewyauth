@@ -2,6 +2,8 @@
 #include "config.h"
 #endif
 
+#define _GNU_SOURCE
+
 #include "php.h"
 #include "php_ini.h"
 #include "ext/standard/info.h"
@@ -9,38 +11,35 @@
 #include "zend_operators.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
-#include <strings.h>
-#include <time.h>
+
+extern void zend_vm_set_opcode_handler(zend_op *opline);
 
 /* ---------------- state ---------------- */
 
-static void (*orig_execute_ex)(zend_execute_data *ed) = NULL;
-static void (*orig_curl_setopt)(zend_execute_data *ed, zval *rv) = NULL;
-static void (*orig_curl_setopt_array)(zend_execute_data *ed, zval *rv) = NULL;
-static void (*orig_session_start)(zend_execute_data *ed, zval *rv) = NULL;
+static void (*o_function_exists)(zend_execute_data *, zval *) = NULL;
+static void (*o_session_start)(zend_execute_data *, zval *) = NULL;
+static void (*o_curl_setopt)(zend_execute_data *, zval *) = NULL;
+static void (*o_curl_setopt_array)(zend_execute_data *, zval *) = NULL;
 
-static int g_on = 1;
+static int g_enable = 1;
 static int g_block_report = 1;
-static int g_force_remote = 0;
-static int g_trace = 0;
-static char g_logfile[512] = {0};
-static char g_msg[256] = "缓存授权验证成功";
-static int g_hooked_curl = 0;
 static int g_session_auth = 1;
-static int g_hooked_session = 0;
+static char g_log[512];
+static char g_msg[128] = "缓存授权验证成功";
+static int g_patched = 0;
 
-static zend_function *find_internal(const char *name, size_t nlen);
+#define CURLOPT_URL_IDX 10002L
 
 static void ewy_log(const char *fmt, ...)
 {
     FILE *fp;
     va_list ap;
-    if (!g_logfile[0]) return;
-    fp = fopen(g_logfile, "a");
+    if (!g_log[0]) return;
+    fp = fopen(g_log, "a");
     if (!fp) return;
-    fprintf(fp, "[%ld] ", (long) time(NULL));
     va_start(ap, fmt);
     vfprintf(fp, fmt, ap);
     va_end(ap);
@@ -48,191 +47,216 @@ static void ewy_log(const char *fmt, ...)
     fclose(fp);
 }
 
-static int zstr_is(zend_string *s, const char *lit)
+/* ---------------- op_array 补丁 ---------------- */
+
+static void fill_authorized(zval *zv)
 {
-    if (!s) return 0;
-    return zend_binary_strcasecmp(ZSTR_VAL(s), ZSTR_LEN(s), lit, strlen(lit)) == 0;
+    array_init(zv);
+    add_assoc_bool(zv, "authorized", 1);
+    add_assoc_string(zv, "message", g_msg);
+    add_assoc_string(zv, "domain", "");
+    add_assoc_string(zv, "expected_domain", "");
 }
 
-/* ---------------- return rewriting ---------------- */
-
-static void ret_authorized(zend_execute_data *ed)
+static void fill_ok(zval *zv)
 {
-    zval *rv = ed->return_value;
-    if (!rv) return;
-    zval_ptr_dtor(rv);
-    array_init(rv);
-    add_assoc_bool(rv, "authorized", 1);
-    add_assoc_string(rv, "message", g_msg);
-    add_assoc_string(rv, "domain", "");
-    add_assoc_string(rv, "expected_domain", "");
+    zval d;
+    array_init(zv);
+    add_assoc_bool(zv, "ok", 1);
+    add_assoc_bool(zv, "success", 1);
+    add_assoc_string(zv, "result", "pass");
+    add_assoc_string(zv, "message", "skipped");
+    array_init(&d);
+    add_assoc_zval(zv, "data", &d);
 }
-
-static void ret_ok(zend_execute_data *ed, const char *msg)
-{
-    zval *rv = ed->return_value;
-    zval data;
-    if (!rv) return;
-    zval_ptr_dtor(rv);
-    array_init(rv);
-    add_assoc_bool(rv, "ok", 1);
-    add_assoc_bool(rv, "success", 1);
-    add_assoc_string(rv, "result", "pass");
-    add_assoc_string(rv, "message", (char *) msg);
-    array_init(&data);
-    add_assoc_zval(rv, "data", &data);
-}
-
-/* ---------------- execute_ex hook ---------------- */
-
-static void ewy_execute_ex(zend_execute_data *ed)
-{
-    if (g_on && ed && ed->func && ed->func->type == ZEND_USER_FUNCTION) {
-        zend_string *fn = ed->func->common.function_name;
-
-        if (g_trace && fn) ewy_log("call %s", ZSTR_VAL(fn));
-
-        if (zstr_is(fn, "verifyAuthorization")) {
-            ret_authorized(ed);
-            ewy_log("force verifyAuthorization() => authorized=true");
-            return;
-        }
-
-        if (zstr_is(fn, "reportAuthorizedInstallation")) {
-            ret_ok(ed, "skipped");
-            ewy_log("block reportAuthorizedInstallation() [admin_path not sent]");
-            return;
-        }
-
-        if (g_force_remote && fn) {
-            zend_class_entry *ce = ed->func->common.scope;
-            if (ce && (zstr_is(ce->name, "LicenseSdkV2") || zstr_is(ce->name, "HuanwareLicenseClient"))) {
-                if (zstr_is(fn, "verify") || zstr_is(fn, "bind")) {
-                    ret_ok(ed, "skipped");
-                    ewy_log("force %s::%s() => ok", ZSTR_VAL(ce->name), ZSTR_VAL(fn));
-                    return;
-                }
-            }
-        }
-    }
-    orig_execute_ex(ed);
-}
-
-/* ---------------- session hook ---------------- */
 
 /*
- * backend gate: ewy/header.php
- *   if ($_SESSION['auth'] !== true) { SELECT state FROM auth_25y ... }
- *   header("Location: ./?page=auth"); exit;
- * set the flag right after the session starts, so the DB probe never runs.
+ * 把函数体压成一条 ZEND_RETURN：
+ *   literals[0] -> 要返回的数组
+ *   opcodes[0]  -> RETURN CONST(literals[0])
+ *   last        -> 1
  */
-static void ewy_session_start(zend_execute_data *ed, zval *rv)
+static int patch_op_array(zend_function *f, int ok_mode)
 {
-    orig_session_start(ed, rv);
+    zend_op_array *oa;
+    zend_op *op;
 
-    if (!g_on || !g_session_auth) return;
-    if (!rv || Z_TYPE_P(rv) != IS_TRUE) return;
+    if (!f || f->type != ZEND_USER_FUNCTION) return 0;
+
+    oa = &f->op_array;
+    if (!oa->opcodes || oa->last < 1 || oa->last_literal < 1 || !oa->literals)
+        return 0;
+
+    /* 已经压成单条 RETURN 就不再动 */
+    if (oa->last == 1 && oa->opcodes[0].opcode == ZEND_RETURN)
+        return 0;
+
+    zval_ptr_dtor(&oa->literals[0]);
+    if (ok_mode) fill_ok(&oa->literals[0]);
+    else         fill_authorized(&oa->literals[0]);
+
+    op = &oa->opcodes[0];
+    memset(op, 0, sizeof(zend_op));
+    op->opcode = ZEND_RETURN;
+    op->op1_type = IS_CONST;
+    op->op1.constant = (uint32_t) ((char *) &oa->literals[0] - (char *) op);
+    op->op2_type = IS_UNUSED;
+    op->result_type = IS_UNUSED;
+    op->lineno = oa->line_start;
+
+    zend_vm_set_opcode_handler(op);
+    oa->last = 1;
+    return 1;
+}
+
+static void patch_if_present(const char *name, size_t len, int ok_mode)
+{
+    char low[128];
+    zend_string *key;
+    zend_function *f = NULL;
+    size_t i;
+
+    if (len >= sizeof(low)) return;
+
+    /* 函数表里的 key 一律小写 */
+    for (i = 0; i < len; i++) {
+        char c = name[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? (char) (c + 32) : c;
+    }
+    low[len] = 0;
+
+    key = zend_string_init(low, len, 0);
+    if (EG(function_table)) f = zend_hash_find_ptr(EG(function_table), key);
+    if (!f && CG(function_table)) f = zend_hash_find_ptr(CG(function_table), key);
+    zend_string_release(key);
+
+    if (f && patch_op_array(f, ok_mode)) {
+        g_patched++;
+        ewy_log("[ewyauth] patched %s", name);
+    }
+}
+
+/* ---------------- function_exists 钩子 ---------------- */
+
+static void ewy_function_exists(zend_execute_data *execute_data, zval *return_value)
+{
+    zval *arg;
+
+    o_function_exists(execute_data, return_value);
+
+    if (!g_enable || !EG(function_table)) return;
+    if (ZEND_CALL_NUM_ARGS(execute_data) < 1) return;
+
+    arg = ZEND_CALL_ARG(execute_data, 1);
+    if (!arg || Z_TYPE_P(arg) != IS_STRING) return;
+
+    /* 每次 function_exists 都尝试补一次（幂等，已打过补丁的直接返回） */
+    patch_if_present("verifyAuthorization", sizeof("verifyAuthorization") - 1, 0);
+    patch_if_present("reportAuthorizedInstallation",
+                     sizeof("reportAuthorizedInstallation") - 1, 1);
+}
+
+/* ---------------- session_start 钩子（后台门禁） ---------------- */
+
+static void ewy_session_start(zend_execute_data *execute_data, zval *return_value)
+{
+    zval *sess;
+
+    o_session_start(execute_data, return_value);
+
+    if (!g_enable || !g_session_auth) return;
+    if (!return_value || Z_TYPE_P(return_value) != IS_TRUE) return;
 
     zend_is_auto_global_str(ZEND_STRL("_SESSION"));
+    sess = zend_hash_str_find(&EG(symbol_table), "_SESSION", sizeof("_SESSION") - 1);
+    if (!sess) return;
+    ZVAL_DEREF(sess);
+    if (Z_TYPE_P(sess) != IS_ARRAY) return;
+
     {
-        zval *sess = zend_hash_str_find(&EG(symbol_table), "_SESSION", sizeof("_SESSION") - 1);
-        if (sess) {
-            ZVAL_DEREF(sess);
-            if (Z_TYPE_P(sess) == IS_ARRAY) {
-                zval t;
-                ZVAL_TRUE(&t);
-                zend_hash_str_update(Z_ARRVAL_P(sess), "auth", sizeof("auth") - 1, &t);
-                ewy_log("session_start: $_SESSION['auth'] = true");
-            }
-        }
+        zval t;
+        ZVAL_TRUE(&t);
+        zend_hash_str_update(Z_ARRVAL_P(sess), "auth", sizeof("auth") - 1, &t);
+        ewy_log("[ewyauth] $_SESSION['auth'] = true");
     }
 }
 
-static void hook_session(void)
-{
-    zend_function *f;
-    if (g_hooked_session) return;
-
-    f = find_internal("session_start", sizeof("session_start") - 1);
-    if (f && f->internal_function.handler) {
-        if (!orig_session_start) orig_session_start = (void *) f->internal_function.handler;
-        f->internal_function.handler = (void (*)(zend_execute_data *, zval *)) ewy_session_start;
-        g_hooked_session = 1;
-        ewy_log("session hook installed");
-    }
-}
-
-/* ---------------- curl hook ---------------- */
-
-#define CURLOPT_URL_IDX 10002L
+/* ---------------- curl 钩子（上报兜底） ---------------- */
 
 static void rewrite_url(zval *zv)
 {
     zval tmp;
     if (!zv || Z_TYPE_P(zv) != IS_STRING) return;
     if (!strstr(Z_STRVAL_P(zv), "/api/client/report/")) return;
-    ewy_log("block curl url: %s", Z_STRVAL_P(zv));
+    ewy_log("[ewyauth] block curl %s", Z_STRVAL_P(zv));
     ZVAL_STRING(&tmp, "http://127.0.0.1:1/__blocked__");
     zval_ptr_dtor(zv);
     ZVAL_COPY_VALUE(zv, &tmp);
 }
 
-static void ewy_curl_setopt(zend_execute_data *ed, zval *rv)
+static void ewy_curl_setopt(zend_execute_data *execute_data, zval *return_value)
 {
-    if (g_on && g_block_report && ZEND_CALL_NUM_ARGS(ed) >= 3) {
-        zval *opt = ZEND_CALL_ARG(ed, 2);
-        zval *val = ZEND_CALL_ARG(ed, 3);
+    if (g_enable && g_block_report && ZEND_CALL_NUM_ARGS(execute_data) >= 3) {
+        zval *opt = ZEND_CALL_ARG(execute_data, 2);
+        zval *val = ZEND_CALL_ARG(execute_data, 3);
         if (Z_TYPE_P(opt) == IS_LONG && Z_LVAL_P(opt) == CURLOPT_URL_IDX) rewrite_url(val);
     }
-    orig_curl_setopt(ed, rv);
+    o_curl_setopt(execute_data, return_value);
 }
 
-static void ewy_curl_setopt_array(zend_execute_data *ed, zval *rv)
+static void ewy_curl_setopt_array(zend_execute_data *execute_data, zval *return_value)
 {
-    if (g_on && g_block_report && ZEND_CALL_NUM_ARGS(ed) >= 2) {
-        zval *arr = ZEND_CALL_ARG(ed, 2);
+    if (g_enable && g_block_report && ZEND_CALL_NUM_ARGS(execute_data) >= 2) {
+        zval *arr = ZEND_CALL_ARG(execute_data, 2);
         if (Z_TYPE_P(arr) == IS_ARRAY) {
             zval *u = zend_hash_index_find(Z_ARRVAL_P(arr), (zend_ulong) CURLOPT_URL_IDX);
             if (u) rewrite_url(u);
         }
     }
-    orig_curl_setopt_array(ed, rv);
+    o_curl_setopt_array(execute_data, return_value);
 }
 
-static zend_function *find_internal(const char *name, size_t nlen)
+/* ---------------- 内部函数 handler 替换 ---------------- */
+
+static zend_function *find_internal(const char *name, size_t len)
 {
     zend_function *f = NULL;
-    if (CG(function_table)) f = zend_hash_str_find_ptr(CG(function_table), name, nlen);
-    if (!f && EG(function_table)) f = zend_hash_str_find_ptr(EG(function_table), name, nlen);
+    if (CG(function_table)) f = zend_hash_str_find_ptr(CG(function_table), name, len);
+    if (!f && EG(function_table)) f = zend_hash_str_find_ptr(EG(function_table), name, len);
     return (f && f->type == ZEND_INTERNAL_FUNCTION) ? f : NULL;
 }
 
-static void hook_curl(void)
+static void hook_one(const char *name, size_t len,
+                     void (**orig)(zend_execute_data *, zval *),
+                     void (*repl)(zend_execute_data *, zval *))
 {
-    zend_function *f;
+    zend_function *f = find_internal(name, len);
+    if (!f || !f->internal_function.handler) return;
+    if (!*orig) *orig = f->internal_function.handler;
+    f->internal_function.handler = repl;
+}
 
-    if (g_hooked_curl) return;
+static void install_hooks(void)
+{
+    if (!o_function_exists)
+        hook_one("function_exists", sizeof("function_exists") - 1,
+                 &o_function_exists, ewy_function_exists);
 
-    f = find_internal("curl_setopt", sizeof("curl_setopt") - 1);
-    if (f && f->internal_function.handler) {
-        if (!orig_curl_setopt) orig_curl_setopt = (void *) f->internal_function.handler;
-        f->internal_function.handler = (void (*)(zend_execute_data *, zval *)) ewy_curl_setopt;
-    }
+    if (g_session_auth && !o_session_start)
+        hook_one("session_start", sizeof("session_start") - 1,
+                 &o_session_start, ewy_session_start);
 
-    f = find_internal("curl_setopt_array", sizeof("curl_setopt_array") - 1);
-    if (f && f->internal_function.handler) {
-        if (!orig_curl_setopt_array) orig_curl_setopt_array = (void *) f->internal_function.handler;
-        f->internal_function.handler = (void (*)(zend_execute_data *, zval *)) ewy_curl_setopt_array;
-    }
-
-    if (orig_curl_setopt || orig_curl_setopt_array) {
-        g_hooked_curl = 1;
-        ewy_log("curl hooks installed (setopt=%p, setopt_array=%p)",
-                (void *) orig_curl_setopt, (void *) orig_curl_setopt_array);
+    if (g_block_report) {
+        if (!o_curl_setopt)
+            hook_one("curl_setopt", sizeof("curl_setopt") - 1,
+                     &o_curl_setopt, ewy_curl_setopt);
+        if (!o_curl_setopt_array)
+            hook_one("curl_setopt_array", sizeof("curl_setopt_array") - 1,
+                     &o_curl_setopt_array, ewy_curl_setopt_array);
     }
 }
 
-/* ---------------- ini ---------------- */
+/* ---------------- ini / 模块 ---------------- */
 
 static char *ini_s(const char *n) { return zend_ini_string((char *) n, strlen(n), 0); }
 
@@ -245,63 +269,37 @@ static int ini_b(const char *n)
     return 1;
 }
 
-static void load_ini(void)
-{
-    char *v;
-
-    g_on = ini_b("ewyauth.enable");
-    g_block_report = ini_b("ewyauth.block_report");
-    g_force_remote = ini_b("ewyauth.force_remote");
-    g_trace = ini_b("ewyauth.trace");
-    g_session_auth = ini_b("ewyauth.session_auth");
-
-    v = ini_s("ewyauth.log");
-    if (v && *v) {
-        strncpy(g_logfile, v, sizeof(g_logfile) - 1);
-        g_logfile[sizeof(g_logfile) - 1] = 0;
-    }
-
-    v = ini_s("ewyauth.message");
-    if (v && *v) {
-        strncpy(g_msg, v, sizeof(g_msg) - 1);
-        g_msg[sizeof(g_msg) - 1] = 0;
-    }
-}
-
-/* ---------------- module ---------------- */
-
 PHP_INI_BEGIN()
     PHP_INI_ENTRY("ewyauth.enable",       "1", PHP_INI_SYSTEM, NULL)
     PHP_INI_ENTRY("ewyauth.block_report", "1", PHP_INI_SYSTEM, NULL)
-    PHP_INI_ENTRY("ewyauth.force_remote", "0", PHP_INI_SYSTEM, NULL)
     PHP_INI_ENTRY("ewyauth.session_auth", "1", PHP_INI_SYSTEM, NULL)
-    PHP_INI_ENTRY("ewyauth.trace",        "0", PHP_INI_SYSTEM, NULL)
     PHP_INI_ENTRY("ewyauth.log",          "",  PHP_INI_SYSTEM, NULL)
     PHP_INI_ENTRY("ewyauth.message", "缓存授权验证成功", PHP_INI_SYSTEM, NULL)
 PHP_INI_END()
 
 PHP_MINIT_FUNCTION(ewyauth)
 {
+    const char *p;
+
     REGISTER_INI_ENTRIES();
-    load_ini();
 
-    orig_execute_ex = zend_execute_ex;
-    zend_execute_ex = ewy_execute_ex;
+    g_enable = ini_b("ewyauth.enable");
+    g_block_report = ini_b("ewyauth.block_report");
+    g_session_auth = ini_b("ewyauth.session_auth");
 
-    hook_curl();
-    hook_session();
+    p = ini_s("ewyauth.log");
+    if (p && *p) {
+        strncpy(g_log, p, sizeof(g_log) - 1);
+    } else {
+        p = getenv("EWYAUTH_LOG");
+        if (p && *p) strncpy(g_log, p, sizeof(g_log) - 1);
+    }
 
-    ewy_log("module init: enable=%d block_report=%d force_remote=%d",
-            g_on, g_block_report, g_force_remote);
+    p = ini_s("ewyauth.message");
+    if (p && *p) strncpy(g_msg, p, sizeof(g_msg) - 1);
 
-    return SUCCESS;
-}
+    if (g_enable) install_hooks();
 
-PHP_RINIT_FUNCTION(ewyauth)
-{
-    /* curl may be loaded after us; retry once per request until installed */
-    if (g_on && g_block_report) hook_curl();
-    if (g_on && g_session_auth) hook_session();
     return SUCCESS;
 }
 
@@ -309,40 +307,46 @@ PHP_MSHUTDOWN_FUNCTION(ewyauth)
 {
     zend_function *f;
 
-    if (orig_execute_ex) {
-        zend_execute_ex = orig_execute_ex;
-        orig_execute_ex = NULL;
+    if (o_function_exists) {
+        f = find_internal("function_exists", sizeof("function_exists") - 1);
+        if (f) f->internal_function.handler = o_function_exists;
+        o_function_exists = NULL;
     }
-
-    if (orig_curl_setopt) {
-        f = find_internal("curl_setopt", sizeof("curl_setopt") - 1);
-        if (f) f->internal_function.handler = (void (*)(zend_execute_data *, zval *)) orig_curl_setopt;
-        orig_curl_setopt = NULL;
-    }
-
-    if (orig_session_start) {
+    if (o_session_start) {
         f = find_internal("session_start", sizeof("session_start") - 1);
-        if (f) f->internal_function.handler = (void (*)(zend_execute_data *, zval *)) orig_session_start;
-        orig_session_start = NULL;
+        if (f) f->internal_function.handler = o_session_start;
+        o_session_start = NULL;
     }
-
-    if (orig_curl_setopt_array) {
+    if (o_curl_setopt) {
+        f = find_internal("curl_setopt", sizeof("curl_setopt") - 1);
+        if (f) f->internal_function.handler = o_curl_setopt;
+        o_curl_setopt = NULL;
+    }
+    if (o_curl_setopt_array) {
         f = find_internal("curl_setopt_array", sizeof("curl_setopt_array") - 1);
-        if (f) f->internal_function.handler = (void (*)(zend_execute_data *, zval *)) orig_curl_setopt_array;
-        orig_curl_setopt_array = NULL;
+        if (f) f->internal_function.handler = o_curl_setopt_array;
+        o_curl_setopt_array = NULL;
     }
 
     UNREGISTER_INI_ENTRIES();
     return SUCCESS;
 }
 
+PHP_RINIT_FUNCTION(ewyauth)
+{
+    /* curl 扩展可能晚于本扩展 MINIT；每请求兜底一次（只换 handler） */
+    if (g_enable) install_hooks();
+    return SUCCESS;
+}
+
 PHP_MINFO_FUNCTION(ewyauth)
 {
     php_info_print_table_start();
-    php_info_print_table_row(2, "ewyauth", "enabled");
-    php_info_print_table_row(2, "verifyAuthorization", "forced to authorized=true");
-    php_info_print_table_row(2, "reportAuthorizedInstallation", g_block_report ? "blocked" : "passthrough");
-    php_info_print_table_row(2, "log", g_logfile[0] ? g_logfile : "(off)");
+    php_info_print_table_row(2, "ewyauth", g_enable ? "on" : "off");
+    php_info_print_table_row(2, "hook function_exists", o_function_exists ? "on" : "off");
+    php_info_print_table_row(2, "hook session_start", o_session_start ? "on" : "off");
+    php_info_print_table_row(2, "hook curl", (o_curl_setopt || o_curl_setopt_array) ? "on" : "off");
+    php_info_print_table_row(2, "patched", g_patched ? "yes" : "no");
     php_info_print_table_end();
 }
 
@@ -355,7 +359,7 @@ zend_module_entry ewyauth_module_entry = {
     PHP_RINIT(ewyauth),
     NULL,
     PHP_MINFO(ewyauth),
-    "0.1",
+    "1.1.0",
     STANDARD_MODULE_PROPERTIES
 };
 

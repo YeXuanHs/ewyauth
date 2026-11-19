@@ -2,7 +2,7 @@
 
 `ewy` / `25y` 4.0.6 模板运行时的授权门禁补丁，一个 PHP 扩展（7.2 / 7.3 / 7.4，NTS，x86_64 Linux）。
 
-不改任何一个 SourceGuardian 加密文件，不伪造远程签名，不劫持 DNS，只在运行时接管三个入口。
+不改任何一个 SourceGuardian 加密文件，不伪造远程签名，不劫持 DNS。
 
 ---
 
@@ -10,96 +10,57 @@
 
 ### 1.1 授权判定在哪
 
-这套模板的授权不是一处，而是**两条互不相干的链路**：
+这套模板的授权是**两条互不相干的链路**：
 
 | 范围 | 入口 | 判定依据 | 未通过表现 |
 |---|---|---|---|
 | 前台（`themes/web`、`themes/cart`、`themes/clientarea`） | 控制器 `_auth_check()` → `verifyAuthorization()` | 远程/缓存校验结果 `authorized === true` | `403 未授权访问` |
-| 后台（`ewy/*` 全部页面） | `ewy/header.php` 顶部 | `$_SESSION['auth'] === true`；不满足才 `SELECT state FROM auth_25y LIMIT 1`，`state == 1` 才置位 | `302 → ./?page=auth`（绑定页） |
+| 后台（`ewy/*` 全部页面） | `ewy/header.php` | `$_SESSION['auth'] === true`，否则查 `auth_25y.state` | `302 → ./?page=auth` |
 
-两条链路的源头都是 SourceGuardian 加密的 PHP，磁盘上是密文，改不了。但它们的**判定动作**分别是：
+源头都是 SG 加密文件，磁盘上是密文。
 
-- 一次普通的用户函数调用（`verifyAuthorization()`）
-- 一次会话状态判断（`$_SESSION['auth']`）
+### 1.2 为什么不能钩 `zend_execute_ex`
 
-这两样都在 Zend 引擎层，可以在函数执行前拦截。
+按理说包一层 `zend_execute_ex` 就能在函数执行前拦截。**但在这套 SG 上不成立**：
 
-### 1.2 为什么能拿到函数名
+SourceGuardian 17 在 `enable_vm_hybrid=1` 下虽然产出标准 `zend_op_array`，**执行却走它自己的解释器** —— SG→SG 的函数调用完全不经过 Zend 的 `execute_ex`。实测：整条 `_auth_check() → verifyAuthorization()` 调用链里，`zend_execute_ex` 一次都没被调用；而用 PHP 代码主动去调同一个 SG 函数时，钩子又能命中。
 
-SourceGuardian 17 在 `sourceguardian.enable_vm_hybrid=1` 下，会把加密字节码还原成**标准 `zend_op_array`** 交给 Zend 执行 —— opcode 没有被替换、handler 没有被劫持、**函数名和类名完整保留**。所以加密与否不影响按函数名匹配。
+结论：**函数名级的执行钩子对 SG 内部调用无效**，必须换层面。
 
-### 1.3 三层接管
+### 1.3 走 `function_exists` + op_array 补丁
 
-| 层 | 手段 | 用途 |
-|---|---|---|
-| 用户函数 | 包 `zend_execute_ex` | 命中 `verifyAuthorization` / `reportAuthorizedInstallation` 后直接写返回值、跳过函数体 |
-| 内部函数 | 替换 `zend_internal_function.handler` 指针 | `session_start`（写会话标志）、`curl_setopt` / `curl_setopt_array`（改 URL） |
-| 返回值 | 直接写 `execute_data->return_value` | 伪造 `['authorized' => true]` / `['ok' => true]`，不需要函数真的执行 |
+`_auth_check()` 的实现里，调用前一句正好是判断：
 
-> 为什么内部函数要换 handler 指针而不是包 `zend_execute_internal`：PHP 7 的 ICALL 走 fastcall 快路径，
-> 即使设置了 `zend_execute_internal` 也拦不到，只有换 `handler` 才生效。
+```php
+if (function_exists("verifyAuthorization")) {
+    $cv8 = verifyAuthorization();     // ← 紧接着就调了
+```
+
+而 `function_exists()` 是**内部函数**，SG 调内部函数是走函数表 handler 的 —— 这个钩得住。
+
+所以：钩 `function_exists()`，在它被调用的那一刻，把目标函数的 `zend_op_array` **原地压成一条 `ZEND_RETURN`**：
+
+```
+literals[0]  -> ['authorized' => true, ...]
+opcodes[0]   -> ZEND_RETURN  CONST(literals[0])
+last         -> 1
+```
+
+补丁做完后再调 `verifyAuthorization()`，函数体根本不执行，直接返回我们的数组。这跟 Swoole 那套把 `templateAuthorization` 改成 `ZEND_RETURN true` 是同一招，只是触发点从"函数入口"换成了"函数被问到的那一刻"。
+
+补丁是**幂等**的：`last == 1 && opcode == ZEND_RETURN` 就直接跳过，不会重复改。
 
 ---
 
 ## 二、做了什么
 
-三个接管点，一一对应三条链路。
+| # | 接管点 | 处理 |
+|---|---|---|
+| 1 | `function_exists()` | 每次调用都尝试给 `verifyAuthorization` / `reportAuthorizedInstallation` 打 op_array 补丁（幂等） |
+| 2 | `session_start()` | 替换 handler，会话建立后写 `$_SESSION['auth'] = true` → 后台 `header.php` 不再查 `auth_25y`、不再跳绑定页 |
+| 3 | `curl_setopt` / `curl_setopt_array` | 命中 `CURLOPT_URL` 且含 `/api/client/report/` 时改写成不可达地址，作为上报拦截的兜底 |
 
-### 2.1 前台门禁：`verifyAuthorization()`
-
-```c
-if (zstr_is(fn, "verifyAuthorization")) {
-    ret_authorized(ed);   /* 写 return_value 后直接 return，函数体不执行 */
-    return;
-}
-```
-
-返回值固定为：
-
-```php
-['authorized' => true, 'message' => '缓存授权验证成功', 'domain' => '', 'expected_domain' => '']
-```
-
-因为函数体压根没跑，所以**不读 `ewy/data.php`、不连 MySQL、不查 `auth_25y`、不发任何 HTTP 请求**。
-前台 `_auth_check()` 只判断 `authorized === true`，拿到就直接放行。
-
-### 2.2 后台门禁：`session_start()`
-
-后台判断的第一句是 `$_SESSION['auth'] !== true`，不满足才去查库。所以只要会话一建立就把标志写进去：
-
-```c
-static void ewy_session_start(zend_execute_data *ed, zval *rv)
-{
-    orig_session_start(ed, rv);
-    if (Z_TYPE_P(rv) != IS_TRUE) return;
-
-    zend_is_auto_global_str(ZEND_STRL("_SESSION"));
-    zval *sess = zend_hash_str_find(&EG(symbol_table), "_SESSION", sizeof("_SESSION") - 1);
-    if (sess) {
-        ZVAL_DEREF(sess);
-        if (Z_TYPE_P(sess) == IS_ARRAY) {
-            zval t;
-            ZVAL_TRUE(&t);
-            zend_hash_str_update(Z_ARRVAL_P(sess), "auth", sizeof("auth") - 1, &t);
-        }
-    }
-}
-```
-
-`header.php` 判断时 `$_SESSION['auth']` 已经是 `true`，`SELECT state FROM auth_25y` 那条查询根本不会执行，
-也不会 `302` 到绑定页。
-
-### 2.3 上报拦截：`reportAuthorizedInstallation()`
-
-这套模板通过 `POST /api/client/report/` 把**后台目录名**（`custom_info.admin_path`）回传授权站，
-另外两个客户端分别发往 `license.rain.mo.cn` / `license-out.huanware.cn` / `license-cf.xkshop.top` 和 `auth.鱼饼饼.online`。
-
-做了两道拦截：
-
-1. **方法级**：命中 `reportAuthorizedInstallation` 直接返回 `['ok' => true, 'result' => 'pass', 'data' => []]`，方法体不执行
-2. **传输级**：兜底改写 curl 的 `CURLOPT_URL`（10002），凡命中 `/api/client/report/` 一律替换为 `http://127.0.0.1:1/__blocked__`
-
-`curl_setopt` 和 `curl_setopt_array` 两个函数都接管，业务代码用哪种写法都拦得住。
+`reportAuthorizedInstallation` 一并压成返回 `['ok' => true, 'result' => 'pass']`，方法体不执行 → **后台目录名不会上报**。
 
 ---
 
@@ -107,38 +68,35 @@ static void ewy_session_start(zend_execute_data *ed, zval *rv)
 
 | 项目 | 打补丁前 | 打补丁后 |
 |---|---|---|
-| 前台首页 | `403 未授权访问` | `200` 正常渲染 |
+| 前台首页 | `403 未授权访问` | `200` |
 | 会员中心 / 购物车 | `403` | `200` |
-| 后台任意页面 | `302 → ./?page=auth` | `200` 正常进入 |
+| 后台任意页面 | `302 → ./?page=auth` | `200` |
 | 授权站请求 | 每次校验都发（含后台目录名） | **零外联** |
-| 数据库 | 需 `auth_25y` 有行、域名匹配 | 不需要，无查询 |
-| 加密文件 | — | **一个字节都没改** |
+| 数据库 | 需 `auth_25y` 有行且域名匹配 | **不需要**（函数体不执行，不查库） |
+| 加密文件 | — | 一个字节都没改 |
 
-日志（`ewyauth.log`）：
-
-```
-[1795044793] session hook installed
-[1795044793] session_start: $_SESSION['auth'] = true
-[1795044806] force verifyAuthorization() => authorized=true
-[1795044793] block reportAuthorizedInstallation() [admin_path not sent]
-[1795044793] block curl url: https://license.rain.mo.cn/api/client/report/
-```
-
-实测（真实 SG 加密的 `verify.php`，完整走一遍包含 `require ewy/data.php` 的流程）：
+实测（真实 SG 加密的 `verify.php`，且 `ewy/data.php` 不存在）：
 
 ```
 返回值: {"authorized":true,"message":"缓存授权验证成功","domain":"","expected_domain":""}
 ```
 
-在 `ewy/data.php` 不存在的情况下依然通过 —— 说明确实没有走数据库分支。
+线上压测（9178）：
+
+```
+前台 200 200 200 200 200 200 200 200 200 200     ← 10/10
+后台 302 → /ewy?page=login                        ← 正常未登录跳转
+日志 每次请求恰好一条 patched verifyAuthorization
+FPM 无 SIGSEGV
+```
+
+把 `auth_cache_25y` 整表清空后前台仍然 `200` —— 说明确实不依赖授权数据。
 
 ---
 
 ## 四、安装
 
-从 Releases 下载对应版本的 `ewyauth-<版本>-nts-linux-x86_64.so`，放进 `extension_dir`。
-
-在 `php.ini` 里追加，**顺序必须在 `ixed.<ver>.lin` 之后**：
+从 Releases 下载对应版本的 `.so`，放进 `extension_dir`，在 `php.ini` 里追加（**必须在 `ixed` 之后**）：
 
 ```ini
 extension=/www/server/php/74/lib/php/extensions/no-debug-non-zts-20190902/ixed.7.4.lin
@@ -147,7 +105,6 @@ extension=/www/server/php/74/lib/php/extensions/no-debug-non-zts-20190902/ewyaut
 ewyauth.enable       = 1
 ewyauth.block_report = 1
 ewyauth.session_auth = 1
-ewyauth.force_remote = 0
 ewyauth.log          = /tmp/ewyauth.log
 ```
 
@@ -156,7 +113,7 @@ systemctl restart php-fpm-74
 php --ri ewyauth
 ```
 
-命令行和 FPM 是两份配置，两边都要加；改完必须重启 FPM。
+命令行和 FPM 是两份配置，两边都要加。
 
 ---
 
@@ -165,11 +122,9 @@ php --ri ewyauth
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `ewyauth.enable` | `1` | 总开关 |
-| `ewyauth.block_report` | `1` | 拦截 `reportAuthorizedInstallation()` + curl 层兜底 |
+| `ewyauth.block_report` | `1` | 上报拦截（op_array 补丁 + curl 兜底） |
 | `ewyauth.session_auth` | `1` | 后台 `$_SESSION['auth']` 提权 |
-| `ewyauth.force_remote` | `0` | 同时短路 `LicenseSdkV2::verify` / `HuanwareLicenseClient::verify`、`bind`。后台「绑定授权」页需要提交卡密时才打开 |
-| `ewyauth.trace` | `0` | 记录每个用户函数调用，排障用，量很大 |
-| `ewyauth.log` | 空 | 日志路径，留空不写日志 |
+| `ewyauth.log` | 空 | 日志路径，留空不写（也支持环境变量 `EWYAUTH_LOG`） |
 | `ewyauth.message` | `缓存授权验证成功` | 返回给前台的 message 文案 |
 
 ---
@@ -177,20 +132,21 @@ php --ri ewyauth
 ## 六、验证
 
 ```bash
-# 1. 模块是否加载
-php --ri ewyauth
+php --ri ewyauth                                    # hook function_exists 应为 on
 
-# 2. 前台（200，不再 403）
-curl -sI https://your-host/ | head -1
+curl -sI https://your-host/ | head -1               # 200
+curl -s -o /dev/null -w '%{http_code}\n' https://your-host/<后台目录>/   # 200
 
-# 3. 后台（200，不再 302 到 ?page=auth）
-curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' https://your-host/<后台目录>/
+grep -E 'patched|session|block' /tmp/ewyauth.log
+```
 
-# 4. 日志三行关键信息
-grep -E 'force verifyAuthorization|session_start|block report' /tmp/ewyauth.log
+日志样例：
 
-# 5. 确认没有外联（应无输出）
-grep -E 'license\.rain|huanware|鱼饼饼' /tmp/ewyauth.log
+```
+[ewyauth] patched verifyAuthorization
+[ewyauth] patched reportAuthorizedInstallation
+[ewyauth] $_SESSION['auth'] = true
+[ewyauth] block curl https://license.rain.mo.cn/api/client/report/
 ```
 
 ---
@@ -199,19 +155,17 @@ grep -E 'license\.rain|huanware|鱼饼饼' /tmp/ewyauth.log
 
 | PHP | 架构 | 状态 |
 |---|---|---|
-| 7.2 NTS | x86_64 Linux | 编译、加载通过（行为测试待补） |
+| 7.2 NTS | x86_64 Linux | CI 构建 |
 | 7.3 NTS | x86_64 Linux | 全部行为测试通过 |
 | 7.4 NTS | x86_64 Linux | 全部行为测试通过（主验证版本） |
 
 - ZTS 未验证
-- PHP 8 未适配（`zend_execute_ex` 与内部函数 handler 的调用约定不同）
-- 产物只依赖 `libc.so.6`，最高符号版本 `GLIBC_2.4`，CentOS 7 / Debian 9 及以上可直接加载
+- PHP 8 未适配（内部函数 handler 与 `zend_op` 布局不同）
+- 产物只依赖 `libc.so.6`，最高符号版本 `GLIBC_2.4`，CentOS 7 / Debian 9 以上可直接加载
 
 ---
 
 ## 八、从源码构建
-
-仓库根目录即扩展目录，`config.m4` 与 `ewyauth.c` 平铺：
 
 ```bash
 phpize
@@ -220,15 +174,14 @@ make -j"$(nproc)"
 ls modules/ewyauth.so
 ```
 
-CI（`.github/workflows/release.yml`）在打 `v*` 标签时矩阵编译 7.2 / 7.3 / 7.4，
-每个版本做 `extension_loaded` 冒烟测试，产物连同 `SHA256SUMS` 一起发到 Release；
-也支持 `workflow_dispatch` 手动构建（只出 artifact，不发 Release）。
+CI（`.github/workflows/release.yml`）打 `v*` 标签时矩阵编译 7.2 / 7.3 / 7.4，做 `extension_loaded` 冒烟测试，产物连同 `SHA256SUMS` 发到 Release。
 
 ---
 
 ## 九、注意
 
-- 不写数据库、不改磁盘文件，只动三个入口
-- 不拦业务 curl，只拦 `/api/client/report/` 这一条 URI
-- 与 opcache 无冲突：不重写 op_array，只包执行入口
+- 只在请求内改 op_array 内存，不写磁盘、不写数据库
+- 补丁幂等，同一请求重复触发不会重复改写
+- 与 sukehapp 之类同样钩 `zend_execute_ex` 的扩展没有冲突（本扩展不碰 `zend_execute_ex`）
+- 与 opcache 无冲突（SG 的 op_array 不走 opcache 缓存）
 - 仅用于你自有或已获授权部署的环境
